@@ -1,0 +1,304 @@
+##
+## Scheduled AWS FinOps Analysis
+##
+## Runs every weekday at 08:00 UTC (before business hours):
+## - Daily cost analysis with anomaly detection
+## - Waste scan for idle/over-provisioned resources
+## - Posts digest to Slack with findings summary
+## - Creates GitHub issue if CRITICAL anomalies are found
+## - Generates and uploads weekly Markdown report (Mondays)
+##
+## Required Secrets:
+##   AWS_ROLE_ARN         — IAM role for Cost Explorer access (OIDC)
+##   ANTHROPIC_API_KEY    — For AI explanations
+##   SLACK_WEBHOOK_URL    — FinOps digest channel webhook
+##
+## Required Variables (optional):
+##   AWS_REGION           — Defaults to us-east-1
+##   FINOPS_CHANNEL       — Slack channel override (#finops-alerts)
+##   MIN_SAVINGS_USD      — Minimum waste threshold to report (default 100)
+
+name: Scheduled FinOps Analysis
+
+on:
+  schedule:
+    # Every weekday at 08:00 UTC
+    - cron: "0 8 * * 1-5"
+  workflow_dispatch:
+    inputs:
+      days:
+        description: "Look-back window in days"
+        default: "30"
+        required: false
+      slack:
+        description: "Post to Slack (true/false)"
+        default: "true"
+        required: false
+      min-savings:
+        description: "Minimum monthly savings to report (USD)"
+        default: "100"
+        required: false
+
+permissions:
+  id-token: write    # OIDC for AWS
+  contents: write    # Upload weekly report
+  issues: write      # Create critical anomaly issues
+
+jobs:
+  daily-analysis:
+    name: Daily Cost Analysis
+    runs-on: ubuntu-latest
+    env:
+      AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+      MIN_SAVINGS: ${{ inputs.min-savings || vars.MIN_SAVINGS_USD || '100' }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: finops-scheduled-analysis
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -e ".[dev]" --quiet
+
+      - name: Run cost analysis (JSON output)
+        id: analysis
+        run: |
+          finops analyze \
+            --days ${{ inputs.days || '30' }} \
+            --top 10 \
+            --json-output > /tmp/finops-analysis.json
+
+          # Extract key metrics for downstream steps
+          total_mtd=$(jq -r '.total_mtd' /tmp/finops-analysis.json)
+          anomalies=$(jq -r '.anomaly_count' /tmp/finops-analysis.json)
+          waste=$(jq -r '.waste_monthly_cost' /tmp/finops-analysis.json)
+          waste_items=$(jq -r '.waste_items' /tmp/finops-analysis.json)
+
+          echo "total_mtd=$total_mtd" >> "$GITHUB_OUTPUT"
+          echo "anomaly_count=$anomalies" >> "$GITHUB_OUTPUT"
+          echo "waste_cost=$waste" >> "$GITHUB_OUTPUT"
+          echo "waste_items=$waste_items" >> "$GITHUB_OUTPUT"
+
+          echo "### FinOps Daily Analysis" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Metric | Value |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|--------|-------|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| MTD Spend | \$$total_mtd |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Anomalies | $anomalies |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Waste (monthly) | \$$waste |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Waste items | $waste_items |" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Run waste scan
+        id: waste
+        run: |
+          finops waste \
+            --min-savings ${{ env.MIN_SAVINGS }} \
+            --json-output 2>/dev/null > /tmp/finops-waste.json || true
+
+      - name: Post Slack digest
+        if: ${{ inputs.slack != 'false' && secrets.SLACK_WEBHOOK_URL != '' }}
+        run: |
+          finops analyze \
+            --days 7 \
+            --slack \
+            --json-output > /dev/null
+
+      - name: Create GitHub issue for CRITICAL anomalies
+        if: ${{ steps.analysis.outputs.anomaly_count > 0 }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          anomaly_count="${{ steps.analysis.outputs.anomaly_count }}"
+          waste_cost="${{ steps.analysis.outputs.waste_cost }}"
+          mtd="${{ steps.analysis.outputs.total_mtd }}"
+          date=$(date -u +"%Y-%m-%d")
+
+          # Check if a similar open issue already exists for today
+          existing=$(gh issue list \
+            --label "finops-alert" \
+            --state open \
+            --json title \
+            --jq ".[] | select(.title | contains(\"$date\")) | .title" \
+            | head -1)
+
+          if [ -n "$existing" ]; then
+            echo "Issue already exists for today: $existing"
+            exit 0
+          fi
+
+          gh issue create \
+            --title "🔴 FinOps Alert: $anomaly_count cost anomalies detected — $date" \
+            --label "finops-alert,automated" \
+            --body "$(cat <<EOF
+## AWS Cost Anomalies Detected
+
+**Date**: $date
+**MTD Spend**: \$$mtd
+**Anomalies**: $anomaly_count
+**Identifiable Waste**: \$$waste_cost/month
+
+### What to Do
+
+1. Run \`finops analyze\` for detailed anomaly breakdown
+2. Check the [AWS Cost Explorer](https://console.aws.amazon.com/cost-management/home) for the specific services
+3. Run \`finops waste --terraform\` to generate remediation snippets for waste items
+4. Use \`finops explain --service <ServiceName>\` for AI-powered root cause analysis
+
+### Closing This Issue
+
+Close this issue once the anomalies have been investigated and are either:
+- Expected (comment explaining why)
+- Remediated (add a comment with the fix applied)
+- False positive (add label \`false-positive\` and close)
+
+---
+_Generated by aws-finops-intelligence scheduled analysis_
+EOF
+)"
+
+      - name: Upload analysis artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: finops-analysis-${{ github.run_id }}
+          path: /tmp/finops-analysis.json
+          retention-days: 30
+
+  # ── Weekly Report (Mondays only) ──────────────────────────────────────────────
+  weekly-report:
+    name: Weekly Cost Report
+    runs-on: ubuntu-latest
+    # Only run on Mondays (cron day-of-week = 1)
+    if: github.event_name == 'schedule' && startsWith(github.event.schedule, '0 8 * * 1')
+    env:
+      AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: finops-weekly-report
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -e ".[dev]" --quiet
+
+      - name: Generate weekly forecast report
+        run: |
+          week=$(date -u +"%Y-W%V")
+          finops forecast \
+            --days 45 \
+            --horizon 30 \
+            --top 15 \
+            --output "reports/weekly-${week}.md"
+
+      - name: Generate executive summary
+        run: |
+          month=$(date -u +"%Y-%m")
+          finops report \
+            --month "$month" \
+            --output "reports/executive-${month}.md"
+
+      - name: Commit reports to repository
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git config user.name "FinOps Bot"
+          git config user.email "finops-bot@github.actions"
+          git add reports/
+          git diff --staged --quiet || git commit -m "chore: weekly FinOps reports $(date -u +%Y-%m-%d)"
+          git push
+
+      - name: Upload weekly report artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: weekly-finops-report
+          path: reports/
+          retention-days: 90
+
+  # ── Budget Threshold Alert ────────────────────────────────────────────────────
+  budget-threshold-check:
+    name: Budget Threshold Check
+    runs-on: ubuntu-latest
+    if: always()
+    needs: daily-analysis
+    env:
+      BUDGET_THRESHOLD_USD: ${{ vars.MONTHLY_BUDGET_USD || '10000' }}
+
+    steps:
+      - name: Check if MTD spend exceeds budget
+        if: ${{ needs.daily-analysis.outputs.total_mtd != '' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mtd="${{ needs.daily-analysis.outputs.total_mtd }}"
+          budget="${{ env.BUDGET_THRESHOLD_USD }}"
+          date=$(date -u +"%Y-%m-%d")
+
+          # Integer comparison (strip decimals)
+          mtd_int=${mtd%.*}
+          budget_int=${budget%.*}
+
+          if [ "${mtd_int:-0}" -gt "${budget_int:-99999}" ]; then
+            echo "🚨 BUDGET EXCEEDED: \$${mtd} > \$${budget} threshold"
+
+            # Post Slack alert if configured
+            if [ -n "${{ secrets.SLACK_WEBHOOK_URL }}" ]; then
+              curl -s -X POST "${{ secrets.SLACK_WEBHOOK_URL }}" \
+                -H "Content-Type: application/json" \
+                -d "{
+                  \"blocks\": [{
+                    \"type\": \"header\",
+                    \"text\": {\"type\": \"plain_text\", \"text\": \"🚨 AWS Budget Threshold Exceeded\"}
+                  }, {
+                    \"type\": \"section\",
+                    \"fields\": [
+                      {\"type\": \"mrkdwn\", \"text\": \"*MTD Spend*\n\$${mtd}\"},
+                      {\"type\": \"mrkdwn\", \"text\": \"*Budget*\n\$${budget}\"},
+                      {\"type\": \"mrkdwn\", \"text\": \"*Date*\n${date}\"},
+                      {\"type\": \"mrkdwn\", \"text\": \"*Action*\nRun \`finops waste\` to find savings\"}
+                    ]
+                  }]
+                }"
+            fi
+
+            # Create a high-priority GitHub issue
+            gh issue create \
+              --title "🚨 Budget Alert: MTD spend \$$mtd exceeds \$$budget threshold — $date" \
+              --label "budget-alert,high-priority,automated" \
+              --body "## Monthly Budget Threshold Exceeded
+
+**MTD Spend**: \$$mtd
+**Budget**: \$$budget
+**Date**: $date
+
+Immediate actions:
+1. \`finops analyze\` — identify which services are driving spend
+2. \`finops waste --min-savings 500\` — find quick savings
+3. Check for any runaway batch jobs or auto-scaling events
+
+This issue should be resolved within 24 hours." || true
+          else
+            echo "✅ MTD spend \$${mtd} is within budget \$${budget}"
+          fi
