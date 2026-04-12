@@ -173,6 +173,100 @@ def waste(service: Optional[str], min_savings: float, terraform: bool) -> None:
 
 
 @cli.command()
+@click.option("--days", default=45, show_default=True, help="Days of history to use for projection")
+@click.option("--horizon", default=30, show_default=True, help="Days forward to forecast (30 or 90)")
+@click.option("--top", default=10, show_default=True, help="Show top N services by projected spend")
+@click.option("--json-output", is_flag=True, help="Output as JSON")
+@click.option("--output", default=None, help="Write Markdown report to this file")
+def forecast(days: int, horizon: int, top: int, json_output: bool, output) -> None:
+    """Project future AWS spend using linear regression on historical data."""
+    from finops.collectors.cost_explorer import CostExplorerCollector
+    from finops.analyzers.forecast import forecast_costs, format_forecast_report
+
+    with console.status(f"[bold green]Fetching {days} days of spend data..."):
+        collector = CostExplorerCollector()
+        daily_spend = collector.get_daily_spend(days=days)
+
+    if not daily_spend:
+        console.print("[red]No spend data returned from Cost Explorer.[/red]")
+        sys.exit(1)
+
+    with console.status("[bold yellow]Running forecast model..."):
+        fc = forecast_costs(daily_spend, forecast_days=max(horizon, 90))
+
+    if json_output:
+        click.echo(json.dumps({
+            "forecast_date": str(fc.forecast_date),
+            "total_current_monthly": fc.total_current_monthly,
+            "total_projected_30d": fc.total_projected_30d,
+            "total_projected_90d": fc.total_projected_90d,
+            "month_over_month_change_pct": fc.month_over_month_change_pct,
+            "accelerating_services": fc.accelerating_services,
+            "services": [
+                {
+                    "service": s.service,
+                    "current_daily_avg": s.current_daily_avg,
+                    "projected_30d": s.projected_30d,
+                    "trend": s.trend,
+                    "confidence": s.confidence,
+                    "anomalous": s.anomalous,
+                }
+                for s in fc.services[:top]
+            ],
+        }, indent=2))
+        return
+
+    # Rich table output
+    sign = "+" if fc.month_over_month_change_pct >= 0 else ""
+    color = "red" if fc.month_over_month_change_pct > 10 else "green" if fc.month_over_month_change_pct < 0 else "yellow"
+
+    console.print(Panel(
+        f"[bold]Current est. monthly:[/bold]  ${fc.total_current_monthly:>12,.2f}\n"
+        f"[bold]Projected 30 days:[/bold]     ${fc.total_projected_30d:>12,.2f}  "
+        f"[{color}]({sign}{fc.month_over_month_change_pct:.1f}%)[/{color}]\n"
+        f"[bold]Projected 90 days:[/bold]     ${fc.total_projected_90d:>12,.2f}\n"
+        f"[bold]History used:[/bold]         {fc.history_days:>12} days",
+        title="[bold]AWS Cost Forecast[/bold]",
+        border_style=color,
+    ))
+
+    if fc.accelerating_services:
+        console.print(f"\n[bold red]⚠  Accelerating spend:[/bold red] {', '.join(fc.accelerating_services)}")
+
+    table = Table(title=f"Top {top} Services — 30-Day Projection", box=box.ROUNDED)
+    table.add_column("Service", style="cyan")
+    table.add_column("Daily Avg", justify="right")
+    table.add_column("30d Projected", justify="right", style="bold")
+    table.add_column("Growth/day", justify="right")
+    table.add_column("Trend")
+    table.add_column("Confidence")
+
+    trend_icons = {"growing": "📈", "shrinking": "📉", "stable": "➡️", "volatile": "〰️"}
+
+    for s in fc.services[:top]:
+        growth_color = "red" if s.daily_growth_rate > 3 else "green" if s.daily_growth_rate < -1 else "white"
+        table.add_row(
+            s.service,
+            f"${s.current_daily_avg:,.2f}",
+            f"${s.projected_30d:,.2f}",
+            f"[{growth_color}]{s.daily_growth_rate:+.2f}%[/{growth_color}]",
+            f"{trend_icons.get(s.trend, '')} {s.trend}",
+            s.confidence,
+        )
+    console.print(table)
+
+    if fc.warnings:
+        for w in fc.warnings:
+            console.print(f"[yellow]⚠  {w}[/yellow]")
+
+    if output:
+        report_md = format_forecast_report(fc)
+        with open(output, "w") as f:
+            f.write(report_md)
+        console.print(f"\n[green]✓ Forecast report written to {output}[/green]")
+
+
+@cli.command()
 @click.option("--month", default=None, help="Month to report (YYYY-MM, default: current month)")
 @click.option("--output", default="executive-summary.md", show_default=True, help="Output file path")
 def report(month: Optional[str], output: str) -> None:
