@@ -349,6 +349,238 @@ def _print_summary(total_mtd, forecast, anomalies, waste_items, top_services) ->
         console.print(table)
 
 
+@cli.group()
+def budgets() -> None:
+    """Manage and monitor AWS Budgets."""
+    pass
+
+
+@budgets.command("list")
+@click.option("--json-output", is_flag=True, help="Output as JSON")
+@click.option("--critical-only", is_flag=True, help="Show only budgets at risk (WARNING or CRITICAL)")
+def budgets_list(json_output: bool, critical_only: bool) -> None:
+    """List all AWS budgets with spend status and health indicators."""
+    from finops.analyzers.budgets import BudgetManager
+
+    with console.status("[bold green]Fetching AWS Budgets..."):
+        mgr = BudgetManager()
+        all_budgets = mgr.list_budgets()
+
+    if critical_only:
+        all_budgets = [b for b in all_budgets if b.health != "OK"]
+
+    if not all_budgets:
+        console.print("[green]No budgets found (or none at risk).[/green]")
+        return
+
+    if json_output:
+        click.echo(json.dumps([
+            {
+                "name": b.name,
+                "health": b.health,
+                "limit_usd": b.limit_amount,
+                "actual_spend": b.actual_spend,
+                "forecasted_spend": b.forecasted_spend,
+                "pct_used": b.pct_used,
+                "pct_forecasted": b.pct_forecasted,
+                "days_remaining": b.days_remaining_in_period,
+                "daily_allowance": round(b.burn_rate_daily, 2),
+            }
+            for b in all_budgets
+        ], indent=2))
+        return
+
+    table = Table(
+        title=f"AWS Budgets ({len(all_budgets)} total)",
+        box=box.ROUNDED,
+        show_header=True,
+    )
+    table.add_column("Budget", style="cyan", no_wrap=True)
+    table.add_column("Limit (USD)", justify="right")
+    table.add_column("Actual", justify="right")
+    table.add_column("Forecast", justify="right")
+    table.add_column("Used %", justify="right")
+    table.add_column("Fcst %", justify="right")
+    table.add_column("Days Left", justify="right")
+    table.add_column("Health", justify="center")
+
+    health_colors = {"OK": "green", "WARNING": "yellow", "CRITICAL": "red"}
+
+    for b in all_budgets:
+        color = health_colors[b.health]
+        table.add_row(
+            b.name,
+            f"${b.limit_amount:,.0f}",
+            f"${b.actual_spend:,.0f}",
+            f"${b.forecasted_spend:,.0f}",
+            f"[{color}]{b.pct_used:.1f}%[/{color}]",
+            f"[{color}]{b.pct_forecasted:.1f}%[/{color}]",
+            str(b.days_remaining_in_period) if b.days_remaining_in_period >= 0 else "—",
+            f"[bold {color}]{b.health}[/bold {color}]",
+        )
+
+    console.print(table)
+
+    critical = [b for b in all_budgets if b.health == "CRITICAL"]
+    if critical:
+        console.print("\n[bold red]⚠  CRITICAL budgets (forecast exceeds limit):[/bold red]")
+        for b in critical:
+            overage = b.forecasted_spend - b.limit_amount
+            console.print(
+                f"  • [bold]{b.name}[/bold]: forecast ${b.forecasted_spend:,.0f} "
+                f"(+${overage:,.0f} over limit). "
+                f"Allow ${b.burn_rate_daily:,.2f}/day to stay in budget."
+            )
+
+
+@budgets.command("history")
+@click.argument("budget_name")
+@click.option("--periods", default=6, show_default=True, help="Number of billing periods to show")
+def budgets_history(budget_name: str, periods: int) -> None:
+    """Show historical spend vs budget for a specific budget."""
+    from finops.analyzers.budgets import BudgetManager
+
+    with console.status(f"Fetching history for '{budget_name}'..."):
+        mgr = BudgetManager()
+        history = mgr.get_budget_history(budget_name, periods=periods)
+
+    if not history:
+        console.print(f"[yellow]No history found for budget '{budget_name}'.[/yellow]")
+        return
+
+    table = Table(title=f"Budget History: {budget_name}", box=box.ROUNDED)
+    table.add_column("Period", style="cyan")
+    table.add_column("Budgeted (USD)", justify="right")
+    table.add_column("Actual (USD)", justify="right")
+    table.add_column("Utilization", justify="right")
+    table.add_column("Status", justify="center")
+
+    for h in history:
+        budgeted = h["budgeted"]
+        actual = h["actual"]
+        pct = (actual / budgeted * 100) if budgeted > 0 else 0
+        over = actual > budgeted
+        color = "red" if over else "green" if pct < 80 else "yellow"
+        table.add_row(
+            h["period"],
+            f"${budgeted:,.0f}",
+            f"${actual:,.0f}",
+            f"[{color}]{pct:.1f}%[/{color}]",
+            f"[{color}]{'OVER' if over else 'OK'}[/{color}]",
+        )
+
+    console.print(table)
+
+
+@budgets.command("create")
+@click.option("--name", required=True, help="Budget name")
+@click.option("--limit", required=True, type=float, help="Monthly budget limit in USD")
+@click.option("--alert-threshold", default=80.0, show_default=True, help="Alert when forecasted spend reaches this %% of limit")
+@click.option("--email", default=None, help="Email address for budget alerts")
+@click.option("--sns-topic", default=None, help="SNS topic ARN for budget alerts")
+@click.option("--service-filter", default=None, help="Restrict budget to a specific AWS service (e.g. 'Amazon EC2')")
+@click.option("--dry-run", is_flag=True, help="Show what would be created without actually creating")
+def budgets_create(
+    name: str,
+    limit: float,
+    alert_threshold: float,
+    email: Optional[str],
+    sns_topic: Optional[str],
+    service_filter: Optional[str],
+    dry_run: bool,
+) -> None:
+    """Create a monthly AWS Budget with optional alerts."""
+    console.print(Panel(
+        f"[bold]Name:[/bold]          {name}\n"
+        f"[bold]Monthly Limit:[/bold] ${limit:,.2f} USD\n"
+        f"[bold]Alert at:[/bold]      {alert_threshold}% of limit\n"
+        f"[bold]Email:[/bold]         {email or '(none)'}\n"
+        f"[bold]SNS Topic:[/bold]     {sns_topic or '(none)'}\n"
+        f"[bold]Service Filter:[/bold] {service_filter or '(all services)'}",
+        title="New Budget",
+        border_style="blue",
+    ))
+
+    if dry_run:
+        console.print("[yellow]Dry run — budget NOT created.[/yellow]")
+        return
+
+    from finops.analyzers.budgets import BudgetManager
+
+    with console.status("Creating budget..."):
+        mgr = BudgetManager()
+        try:
+            mgr.create_monthly_budget(
+                name=name,
+                limit_usd=limit,
+                alert_threshold_pct=alert_threshold,
+                email=email,
+                sns_topic_arn=sns_topic,
+                service_filter=service_filter,
+            )
+        except ValueError as e:
+            console.print(f"[red]Error: {e}[/red]")
+            raise SystemExit(1)
+
+    console.print(f"[green]✓ Budget '{name}' created (${limit:,.2f}/mo, alert at {alert_threshold}%)[/green]")
+
+
+@budgets.command("check")
+@click.option("--slack", is_flag=True, help="Post alert to Slack if any budget is at risk")
+@click.option("--fail-on-critical", is_flag=True, help="Exit non-zero if any budget is CRITICAL")
+def budgets_check(slack: bool, fail_on_critical: bool) -> None:
+    """CI-friendly budget health check. Exits non-zero on CRITICAL if --fail-on-critical."""
+    from finops.analyzers.budgets import BudgetManager
+
+    with console.status("Checking budget health..."):
+        mgr = BudgetManager()
+        all_budgets = mgr.list_budgets()
+
+    critical = [b for b in all_budgets if b.health == "CRITICAL"]
+    warning = [b for b in all_budgets if b.health == "WARNING"]
+
+    if not critical and not warning:
+        console.print("[green]✓ All budgets healthy[/green]")
+        return
+
+    for b in critical:
+        console.print(
+            f"[bold red]CRITICAL[/bold red] {b.name}: "
+            f"forecast ${b.forecasted_spend:,.0f} / limit ${b.limit_amount:,.0f} "
+            f"({b.pct_forecasted:.0f}%)"
+        )
+    for b in warning:
+        console.print(
+            f"[bold yellow]WARNING[/bold yellow] {b.name}: "
+            f"forecast ${b.forecasted_spend:,.0f} / limit ${b.limit_amount:,.0f} "
+            f"({b.pct_forecasted:.0f}%)"
+        )
+
+    if slack and (critical or warning):
+        webhook = os.environ.get("SLACK_WEBHOOK_URL")
+        if webhook:
+            import urllib.request
+            payload = json.dumps({
+                "text": (
+                    f":rotating_light: *AWS Budget Alert*\n"
+                    + "\n".join(
+                        f"• *{b.name}*: {b.pct_forecasted:.0f}% of ${b.limit_amount:,.0f} limit forecast"
+                        for b in (critical + warning)
+                    )
+                )
+            }).encode()
+            try:
+                urllib.request.urlopen(urllib.request.Request(
+                    webhook, data=payload, headers={"Content-Type": "application/json"}
+                ))
+                console.print("[green]✓ Slack alert sent[/green]")
+            except Exception as e:
+                console.print(f"[yellow]Slack post failed: {e}[/yellow]")
+
+    if fail_on_critical and critical:
+        raise SystemExit(1)
+
+
 def main() -> None:
     cli()
 
