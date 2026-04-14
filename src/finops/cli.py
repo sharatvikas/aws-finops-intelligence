@@ -581,6 +581,142 @@ def budgets_check(slack: bool, fail_on_critical: bool) -> None:
         raise SystemExit(1)
 
 
+@cli.group()
+def anomalies() -> None:
+    """AWS Cost Anomaly Detection — monitor and respond to ML-detected spend spikes."""
+
+
+@anomalies.command("list")
+@click.option("--days", default=30, show_default=True, help="Look-back window in days")
+@click.option("--min-impact", default=0.0, show_default=True, help="Minimum dollar impact to show")
+@click.option("--severity", type=click.Choice(["CRITICAL", "HIGH", "MEDIUM", "LOW"]), default=None)
+@click.option("--json-output", is_flag=True, help="Output as JSON")
+def anomalies_list(days: int, min_impact: float, severity: str | None, json_output: bool) -> None:
+    """List AWS ML-detected cost anomalies."""
+    from finops.analyzers.aws_anomaly_detection import AnomalyDetectionManager
+
+    with console.status("[bold yellow]Fetching AWS anomaly detections..."):
+        mgr = AnomalyDetectionManager()
+        all_anomalies = mgr.get_anomalies(days_back=days, min_impact_dollars=min_impact)
+
+    if severity:
+        all_anomalies = [a for a in all_anomalies if a.severity == severity]
+
+    if not all_anomalies:
+        console.print("[green]No anomalies detected in the selected window.[/green]")
+        return
+
+    if json_output:
+        import json
+        console.print(json.dumps([
+            {
+                "id": a.anomaly_id,
+                "dimension": a.dimension_value,
+                "start": a.start_date,
+                "end": a.end_date or "ongoing",
+                "actual": a.anomalous_spend,
+                "expected": a.expected_spend,
+                "impact_pct": a.impact_percentage,
+                "impact_usd": a.total_impact,
+                "severity": a.severity,
+                "root_causes": a.root_causes,
+            }
+            for a in all_anomalies
+        ], indent=2))
+        return
+
+    severity_color = {"CRITICAL": "red", "HIGH": "yellow", "MEDIUM": "cyan", "LOW": "white"}
+
+    table = Table(title=f"AWS Cost Anomalies (last {days}d)", box=box.ROUNDED)
+    table.add_column("Severity", justify="center")
+    table.add_column("Service / Dimension")
+    table.add_column("Period")
+    table.add_column("Actual (USD)", justify="right")
+    table.add_column("Expected (USD)", justify="right")
+    table.add_column("Impact", justify="right")
+    table.add_column("Root Cause")
+
+    for a in all_anomalies:
+        color = severity_color.get(a.severity, "white")
+        period = f"{a.start_date}"
+        if a.end_date:
+            period += f" → {a.end_date}"
+        else:
+            period += " → [bold]ongoing[/bold]"
+        rc_str = ""
+        if a.root_causes:
+            rc = a.root_causes[0]
+            parts = [v for v in [rc.get("service"), rc.get("region"), rc.get("usage_type")] if v]
+            rc_str = " / ".join(parts[:2])
+        table.add_row(
+            f"[{color}]{a.severity}[/{color}]",
+            a.dimension_value,
+            period,
+            f"${a.anomalous_spend:,.2f}",
+            f"${a.expected_spend:,.2f}",
+            f"[{color}]+${a.total_impact:,.2f} (+{a.impact_percentage:.0f}%)[/{color}]",
+            rc_str,
+        )
+
+    console.print(table)
+    ongoing = sum(1 for a in all_anomalies if a.is_ongoing)
+    if ongoing:
+        console.print(f"[bold red]{ongoing} anomaly(s) still ongoing[/bold red]")
+
+
+@anomalies.command("setup")
+@click.option("--email", default=None, help="Email address for anomaly alerts")
+@click.option("--sns-arn", default=None, help="SNS topic ARN for alerts")
+@click.option("--threshold", default=100.0, show_default=True, help="Dollar threshold to trigger alert")
+@click.option("--frequency", type=click.Choice(["IMMEDIATELY", "DAILY", "WEEKLY"]), default="DAILY")
+def anomalies_setup(email: str | None, sns_arn: str | None, threshold: float, frequency: str) -> None:
+    """Create default anomaly monitors and alert subscription."""
+    from finops.analyzers.aws_anomaly_detection import AnomalyDetectionManager
+
+    mgr = AnomalyDetectionManager()
+
+    with console.status("[bold yellow]Creating SERVICE anomaly monitor..."):
+        monitor_arn = mgr.create_service_monitor("AllServicesMonitor")
+    console.print(f"[green]✓ Monitor:[/green] {monitor_arn}")
+
+    if email or sns_arn:
+        with console.status("[bold yellow]Creating anomaly subscription..."):
+            sub_arn = mgr.create_subscription(
+                name="FinOps-Anomaly-Alerts",
+                monitor_arns=[monitor_arn],
+                email=email,
+                sns_topic_arn=sns_arn,
+                threshold_dollars=threshold,
+                frequency=frequency,
+            )
+        console.print(f"[green]✓ Subscription:[/green] {sub_arn}")
+        console.print(f"[green]✓ Alerts when anomaly exceeds ${threshold:,.0f} ({frequency})[/green]")
+    else:
+        console.print("[yellow]No email or SNS ARN provided — subscription not created.[/yellow]")
+        console.print("Run with --email or --sns-arn to enable alerts.")
+
+
+@anomalies.command("feedback")
+@click.argument("anomaly_id")
+@click.argument("feedback", type=click.Choice(["ANOMALY", "NOT_ANOMALY", "PLANNED_ACTIVITY"]))
+def anomalies_feedback(anomaly_id: str, feedback: str) -> None:
+    """Provide feedback to improve AWS anomaly detection accuracy.
+
+    ANOMALY_ID: The anomaly ID (from 'anomalies list --json-output')
+    FEEDBACK: ANOMALY (confirm) | NOT_ANOMALY (false positive) | PLANNED_ACTIVITY (expected)
+    """
+    from finops.analyzers.aws_anomaly_detection import AnomalyDetectionManager
+
+    mgr = AnomalyDetectionManager()
+    mgr.provide_feedback(anomaly_id, feedback)
+    label = {
+        "ANOMALY": "[red]confirmed as a real anomaly[/red]",
+        "NOT_ANOMALY": "[green]marked as false positive[/green]",
+        "PLANNED_ACTIVITY": "[cyan]marked as planned activity[/cyan]",
+    }[feedback]
+    console.print(f"[green]✓[/green] Anomaly {anomaly_id} {label} — ML model updated")
+
+
 def main() -> None:
     cli()
 
