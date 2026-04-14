@@ -717,6 +717,133 @@ def anomalies_feedback(anomaly_id: str, feedback: str) -> None:
     console.print(f"[green]✓[/green] Anomaly {anomaly_id} {label} — ML model updated")
 
 
+@cli.group()
+def savings() -> None:
+    """Savings Plans coverage analysis and purchase recommendations."""
+    pass
+
+
+@savings.command("coverage")
+@click.option("--days", default=30, show_default=True, help="Look-back window in days")
+@click.option("--target", default=80.0, show_default=True, help="Target coverage % for recommendations")
+@click.option("--json-output", is_flag=True, help="Output raw JSON")
+def savings_coverage(days: int, target: float, json_output: bool) -> None:
+    """Show current Savings Plans coverage and identify uncovered spend."""
+    from finops.analyzers.savings_plans import SavingsPlansAnalyzer
+
+    with console.status("[bold green]Analyzing Savings Plans coverage..."):
+        analyzer = SavingsPlansAnalyzer(lookback_days=days, coverage_target_pct=target)
+        result = analyzer.analyze()
+
+    if json_output:
+        import dataclasses
+        console.print_json(json.dumps({
+            "account_id": result.account_id,
+            "analysis_date": result.analysis_date,
+            "avg_coverage_pct": result.avg_coverage_pct,
+            "total_uncovered_monthly_usd": result.total_uncovered_monthly_usd,
+            "coverage": dataclasses.asdict(result.coverage) if result.coverage else None,
+        }))
+        return
+
+    # Coverage summary panel
+    coverage = result.coverage
+    if not coverage:
+        console.print("[red]No coverage data available[/red]")
+        return
+
+    gap = target - result.avg_coverage_pct
+    gap_color = "red" if gap > 20 else "yellow" if gap > 5 else "green"
+    panel_text = (
+        f"[bold]Coverage:[/bold] {result.avg_coverage_pct:.1f}%  "
+        f"(target: {target:.0f}%  [{gap_color}]gap: {gap:+.1f}%[/{gap_color}])\n"
+        f"[bold]SP Spend:[/bold]     ${coverage.sp_spend_usd:>12,.2f}\n"
+        f"[bold]On-Demand:[/bold]    ${coverage.on_demand_spend_usd:>12,.2f}  "
+        f"[dim](uncovered over {days} days)[/dim]\n"
+        f"[bold]Total Eligible:[/bold] ${coverage.total_eligible_usd:>12,.2f}\n"
+        f"\n[yellow]Potential savings from covering gap:[/yellow] "
+        f"${coverage.potential_savings_usd:,.0f}/period (~20% SP discount on uncovered OD)"
+    )
+    console.print(Panel(panel_text, title="[bold cyan]Savings Plans Coverage[/bold cyan]", border_style="cyan"))
+
+    # Utilization table
+    if result.utilization:
+        table = Table(title="Existing Savings Plans", box=box.ROUNDED)
+        table.add_column("Plan ID", style="cyan")
+        table.add_column("Type")
+        table.add_column("Commitment/hr", justify="right")
+        table.add_column("Used", justify="right")
+        table.add_column("Unused", justify="right")
+        table.add_column("Utilization %", justify="right")
+        table.add_column("Net Savings", justify="right")
+        for u in result.utilization:
+            pct_color = "red" if u.utilization_pct < 80 else "green"
+            table.add_row(
+                u.plan_id[:12],
+                u.plan_type.replace("SavingsPlans", " SP"),
+                f"${u.commitment_usd / (24 * days):.4f}",
+                f"${u.used_usd:,.0f}",
+                f"[red]${u.unused_usd:,.0f}[/red]" if u.unused_usd > 100 else f"${u.unused_usd:,.0f}",
+                f"[{pct_color}]{u.utilization_pct:.1f}%[/{pct_color}]",
+                f"[green]${u.net_savings_usd:,.0f}[/green]",
+            )
+        console.print(table)
+
+    if result.underutilized_plans:
+        console.print(
+            f"\n[yellow]⚠  {len(result.underutilized_plans)} plan(s) are underutilized (<80%): "
+            f"{', '.join(result.underutilized_plans)}[/yellow]"
+        )
+        console.print("[dim]Consider reducing commitment at renewal to avoid paying for unused capacity.[/dim]")
+
+
+@savings.command("recommend")
+@click.option("--days", default=30, show_default=True, help="Look-back window in days")
+@click.option("--target", default=80.0, show_default=True, help="Target coverage %")
+@click.option("--top", default=3, show_default=True, help="Top N recommendations to show")
+def savings_recommend(days: int, target: float, top: int) -> None:
+    """Show purchase recommendations to improve Savings Plans coverage."""
+    from finops.analyzers.savings_plans import SavingsPlansAnalyzer
+
+    with console.status("[bold green]Fetching SP purchase recommendations..."):
+        analyzer = SavingsPlansAnalyzer(lookback_days=days, coverage_target_pct=target)
+        result = analyzer.analyze()
+
+    recs = result.recommendations[:top]
+    if not recs:
+        console.print("[yellow]No recommendations available. Check that Cost Explorer is enabled.[/yellow]")
+        return
+
+    table = Table(title=f"Top {len(recs)} Savings Plan Recommendations", box=box.ROUNDED)
+    table.add_column("Plan Type")
+    table.add_column("Term", justify="center")
+    table.add_column("Payment")
+    table.add_column("Commitment/hr", justify="right")
+    table.add_column("Monthly Savings", justify="right")
+    table.add_column("Savings %", justify="right")
+    table.add_column("ROI", justify="right")
+    table.add_column("Break-Even", justify="right")
+
+    for rec in recs:
+        table.add_row(
+            rec.plan_type.replace("SavingsPlans", " SP"),
+            f"{rec.term_years}yr",
+            rec.payment_option,
+            f"${rec.hourly_commitment_usd:.4f}",
+            f"[green]${rec.estimated_monthly_savings_usd:,.0f}[/green]",
+            f"[green]{rec.estimated_savings_pct:.1f}%[/green]",
+            f"{rec.estimated_roi_pct:.0f}%",
+            f"{rec.estimated_break_even_months:.1f}mo" if rec.estimated_break_even_months > 0 else "[green]immediate[/green]",
+        )
+    console.print(table)
+
+    best = result.top_recommendation()
+    if best:
+        console.print(
+            f"\n[bold green]Best recommendation:[/bold green] {best.summary()}"
+        )
+
+
 def main() -> None:
     cli()
 
