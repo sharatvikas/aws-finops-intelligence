@@ -2,11 +2,19 @@
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from datetime import date, timedelta
 from typing import Any
 
 import boto3
+from botocore.exceptions import BotoCoreError, ClientError
+
+logger = logging.getLogger(__name__)
+
+
+class CostExplorerError(RuntimeError):
+    """Raised when Cost Explorer data cannot be retrieved."""
 
 
 @dataclass
@@ -28,39 +36,122 @@ class ServiceSpend:
     unit: str = "USD"
 
 
+@dataclass
+class DimensionSpend:
+    """Daily spend for one value of a Cost Explorer dimension (e.g. one usage type)."""
+
+    dimension: str        # e.g. "USAGE_TYPE", "REGION", "LINKED_ACCOUNT"
+    value: str            # e.g. "USE1-BoxUsage:c5.2xlarge"
+    date: str
+    amount: float
+
+
 class CostExplorerCollector:
-    """Collect cost data from AWS Cost Explorer."""
+    """Collect cost data from AWS Cost Explorer.
 
-    def __init__(self, session: boto3.Session) -> None:
-        self._ce = session.client("ce", region_name="us-east-1")
+    Cost Explorer is a global API served from us-east-1 regardless of the
+    session's default region.
+    """
 
-    def get_daily_spend(self, days: int = 30) -> list[DailySpend]:
-        """Get daily spend broken down by service for the last N days."""
+    def __init__(self, session: boto3.Session | None = None) -> None:
+        self._session = session or boto3.Session()
+        self._ce = self._session.client("ce", region_name="us-east-1")
+
+    def get_daily_spend(
+        self,
+        days: int = 30,
+        group_by: str = "SERVICE",
+        service_filter: str | None = None,
+    ) -> list[DailySpend]:
+        """Get daily spend broken down by a dimension (default: service).
+
+        Args:
+            days: Look-back window ending today.
+            group_by: Cost Explorer dimension to group by
+                ("SERVICE" or "LINKED_ACCOUNT").
+            service_filter: Restrict results to a single service name.
+        """
         end = date.today()
         start = end - timedelta(days=days)
 
-        resp = self._ce.get_cost_and_usage(
-            TimePeriod={"Start": str(start), "End": str(end)},
-            Granularity="DAILY",
-            Metrics=["UnblendedCost"],
-            GroupBy=[{"Type": "DIMENSION", "Key": "SERVICE"}],
-        )
+        request: dict[str, Any] = {
+            "TimePeriod": {"Start": str(start), "End": str(end)},
+            "Granularity": "DAILY",
+            "Metrics": ["UnblendedCost"],
+            "GroupBy": [{"Type": "DIMENSION", "Key": group_by}],
+        }
+        if service_filter:
+            request["Filter"] = {
+                "Dimensions": {"Key": "SERVICE", "Values": [service_filter]}
+            }
 
-        results = []
-        for result in resp["ResultsByTime"]:
+        results: list[DailySpend] = []
+        for result in self._paginate_cost_and_usage(request):
             for group in result["Groups"]:
-                service = group["Keys"][0]
+                key = group["Keys"][0]
                 amount = float(group["Metrics"]["UnblendedCost"]["Amount"])
                 unit = group["Metrics"]["UnblendedCost"]["Unit"]
                 if amount > 0:
-                    results.append(DailySpend(
-                        date=result["TimePeriod"]["Start"],
-                        service=service,
-                        amount=amount,
-                        unit=unit,
-                    ))
+                    is_account = group_by == "LINKED_ACCOUNT"
+                    results.append(
+                        DailySpend(
+                            date=result["TimePeriod"]["Start"],
+                            service=(service_filter or "All Services") if is_account else key,
+                            amount=amount,
+                            unit=unit,
+                            account_id=key if is_account else None,
+                        )
+                    )
 
+        logger.debug("Fetched %d daily spend points (%d days, group_by=%s)", len(results), days, group_by)
         return results
+
+    def get_dimension_daily_spend(
+        self,
+        dimension: str,
+        days: int = 30,
+        service_filter: str | None = None,
+        top_n: int = 25,
+    ) -> list[DimensionSpend]:
+        """Daily spend grouped by an arbitrary dimension, optionally scoped to a service.
+
+        Used for root-cause attribution: which USAGE_TYPE / REGION / LINKED_ACCOUNT
+        moved when a service-level anomaly fires.
+        """
+        end = date.today()
+        start = end - timedelta(days=days)
+
+        request: dict[str, Any] = {
+            "TimePeriod": {"Start": str(start), "End": str(end)},
+            "Granularity": "DAILY",
+            "Metrics": ["UnblendedCost"],
+            "GroupBy": [{"Type": "DIMENSION", "Key": dimension}],
+        }
+        if service_filter:
+            request["Filter"] = {
+                "Dimensions": {"Key": "SERVICE", "Values": [service_filter]}
+            }
+
+        results: list[DimensionSpend] = []
+        for result in self._paginate_cost_and_usage(request):
+            for group in result["Groups"]:
+                amount = float(group["Metrics"]["UnblendedCost"]["Amount"])
+                if amount > 0:
+                    results.append(
+                        DimensionSpend(
+                            dimension=dimension,
+                            value=group["Keys"][0],
+                            date=result["TimePeriod"]["Start"],
+                            amount=amount,
+                        )
+                    )
+
+        # Keep only the top_n values by total spend to bound downstream work.
+        totals: dict[str, float] = {}
+        for r in results:
+            totals[r.value] = totals.get(r.value, 0.0) + r.amount
+        keep = {v for v, _ in sorted(totals.items(), key=lambda kv: kv[1], reverse=True)[:top_n]}
+        return [r for r in results if r.value in keep]
 
     def get_service_spend_summary(self) -> list[ServiceSpend]:
         """Get MTD and last-30d spend per service for comparison."""
@@ -70,14 +161,14 @@ class CostExplorerCollector:
         sixty_days_ago = today - timedelta(days=60)
 
         def _fetch(start: date, end: date) -> dict[str, float]:
-            resp = self._ce.get_cost_and_usage(
-                TimePeriod={"Start": str(start), "End": str(end)},
-                Granularity="MONTHLY",
-                Metrics=["UnblendedCost"],
-                GroupBy=[{"Type": "DIMENSION", "Key": "SERVICE"}],
-            )
+            request: dict[str, Any] = {
+                "TimePeriod": {"Start": str(start), "End": str(end)},
+                "Granularity": "MONTHLY",
+                "Metrics": ["UnblendedCost"],
+                "GroupBy": [{"Type": "DIMENSION", "Key": "SERVICE"}],
+            }
             totals: dict[str, float] = {}
-            for result in resp["ResultsByTime"]:
+            for result in self._paginate_cost_and_usage(request):
                 for group in result["Groups"]:
                     svc = group["Keys"][0]
                     amt = float(group["Metrics"]["UnblendedCost"]["Amount"])
@@ -121,5 +212,27 @@ class CostExplorerCollector:
                 "unit": resp["Total"]["Unit"],
                 "confidence_low": float(resp.get("ForecastResultsByTime", [{}])[0].get("MeanValue", 0)),
             }
-        except Exception:
+        except (ClientError, BotoCoreError) as exc:
+            # Forecast requires >= 1 full day of usage history in the period;
+            # degrade gracefully rather than failing the whole run.
+            logger.warning("Cost forecast unavailable: %s", exc)
             return {"forecast_amount": 0, "unit": "USD"}
+
+    def _paginate_cost_and_usage(self, request: dict[str, Any]) -> list[dict[str, Any]]:
+        """Call get_cost_and_usage, following NextPageToken; merge ResultsByTime."""
+        merged: list[dict[str, Any]] = []
+        token: str | None = None
+        try:
+            while True:
+                if token:
+                    request["NextPageToken"] = token
+                else:
+                    request.pop("NextPageToken", None)
+                resp = self._ce.get_cost_and_usage(**request)
+                merged.extend(resp.get("ResultsByTime", []))
+                token = resp.get("NextPageToken")
+                if not token:
+                    return merged
+        except (ClientError, BotoCoreError) as exc:
+            logger.error("Cost Explorer request failed: %s", exc)
+            raise CostExplorerError(f"Cost Explorer request failed: {exc}") from exc

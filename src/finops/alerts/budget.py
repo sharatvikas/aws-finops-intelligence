@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import boto3
-import os
 from dataclasses import dataclass
 from typing import Optional
 

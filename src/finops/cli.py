@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import sys
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import Optional
 
+import boto3
 import click
 from rich.console import Console
 from rich.panel import Panel
@@ -15,13 +17,45 @@ from rich.table import Table
 from rich import box
 
 console = Console()
+# Progress/status chrome goes to stderr so `--json-output | jq` stays clean.
+_err_console = Console(stderr=True)
+
+
+def _build_session(ctx: click.Context) -> boto3.Session:
+    """Build a boto3 session from the global --profile/--region options."""
+    opts = ctx.obj or {}
+    kwargs = {}
+    if opts.get("profile"):
+        kwargs["profile_name"] = opts["profile"]
+    if opts.get("region"):
+        kwargs["region_name"] = opts["region"]
+    return boto3.Session(**kwargs)
+
+
+def _region(ctx: click.Context, session: boto3.Session) -> str:
+    return (ctx.obj or {}).get("region") or session.region_name or "us-east-1"
 
 
 @click.group()
 @click.version_option(version="0.1.0")
-def cli() -> None:
+@click.option("--profile", default=None, envvar="AWS_PROFILE", help="AWS credentials profile")
+@click.option("--region", default=None, envvar="AWS_REGION", help="AWS region for resource scans")
+@click.option("--verbose", "-v", is_flag=True, help="Enable debug logging")
+@click.pass_context
+def cli(ctx: click.Context, profile: Optional[str], region: Optional[str], verbose: bool) -> None:
     """AWS FinOps Intelligence — AI-powered cost analysis and waste detection."""
-    pass
+    ctx.ensure_object(dict)
+    ctx.obj["profile"] = profile
+    ctx.obj["region"] = region
+    logging.basicConfig(
+        level=logging.DEBUG if verbose else logging.WARNING,
+        format="%(asctime)s %(levelname)-7s %(name)s: %(message)s",
+        stream=sys.stderr,
+    )
+    if verbose:
+        # boto3/urllib3 debug output drowns everything else
+        for noisy in ("botocore", "boto3", "urllib3"):
+            logging.getLogger(noisy).setLevel(logging.INFO)
 
 
 @cli.command()
@@ -29,35 +63,30 @@ def cli() -> None:
 @click.option("--top", default=10, show_default=True, help="Number of top services to show")
 @click.option("--slack", is_flag=True, help="Post digest to Slack")
 @click.option("--json-output", is_flag=True, help="Output as JSON instead of rich text")
-def analyze(days: int, top: int, slack: bool, json_output: bool) -> None:
+@click.pass_context
+def analyze(ctx: click.Context, days: int, top: int, slack: bool, json_output: bool) -> None:
     """Run full cost analysis: spend summary, anomalies, and waste detection."""
     from finops.collectors.cost_explorer import CostExplorerCollector
-    from finops.analyzers.anomaly import detect_anomalies, detect_service_trend_anomalies
+    from finops.analyzers.anomaly import detect_anomalies
     from finops.analyzers.waste import WasteDetector
     from finops.reporters.slack import post_daily_digest
 
-    with console.status("[bold green]Fetching AWS cost data..."):
-        collector = CostExplorerCollector()
+    session = _build_session(ctx)
+
+    with _err_console.status("[bold green]Fetching AWS cost data..."):
+        collector = CostExplorerCollector(session)
         daily_spend = collector.get_daily_spend(days=days)
         service_spend = collector.get_service_spend_summary()
-        forecast = collector.get_cost_forecast()
+        forecast = collector.get_cost_forecast().get("forecast_amount", 0.0)
 
     total_mtd = sum(d.amount for d in daily_spend if d.date >= datetime.now().replace(day=1).date().isoformat())
 
-    with console.status("[bold yellow]Detecting anomalies..."):
+    with _err_console.status("[bold yellow]Detecting anomalies..."):
         anomalies = detect_anomalies(daily_spend)
-        trend_anomalies = detect_service_trend_anomalies(service_spend)
-        all_anomalies = anomalies + trend_anomalies
 
-    with console.status("[bold red]Scanning for waste..."):
-        detector = WasteDetector()
-        waste_items = (
-            detector.find_idle_ec2_instances()
-            + detector.find_unattached_ebs_volumes()
-            + detector.find_unassociated_elastic_ips()
-            + detector.find_old_ebs_snapshots()
-            + detector.find_oversized_rds()
-        )
+    with _err_console.status("[bold red]Scanning for waste..."):
+        detector = WasteDetector(session, region=_region(ctx, session))
+        waste_items = detector.detect_all()
 
     top_services = sorted(service_spend, key=lambda s: s.amount_last_30d, reverse=True)[:top]
 
@@ -65,18 +94,18 @@ def analyze(days: int, top: int, slack: bool, json_output: bool) -> None:
         result = {
             "total_mtd": total_mtd,
             "forecast": forecast,
-            "anomaly_count": len(all_anomalies),
+            "anomaly_count": len(anomalies),
             "waste_items": len(waste_items),
             "waste_monthly_cost": sum(w.estimated_monthly_cost for w in waste_items),
         }
         click.echo(json.dumps(result, indent=2))
         return
 
-    _print_summary(total_mtd, forecast, all_anomalies, waste_items, top_services)
+    _print_summary(total_mtd, forecast, anomalies, waste_items, top_services)
 
     if slack:
-        with console.status("Posting to Slack..."):
-            ok = post_daily_digest(total_mtd, forecast, all_anomalies, waste_items, top_services)
+        with _err_console.status("Posting to Slack..."):
+            ok = post_daily_digest(total_mtd, forecast, anomalies, waste_items, top_services)
         if ok:
             console.print("[green]✓ Posted to Slack[/green]")
         else:
@@ -85,15 +114,16 @@ def analyze(days: int, top: int, slack: bool, json_output: bool) -> None:
 
 @cli.command()
 @click.option("--service", required=True, help="AWS service name (e.g. Amazon EC2)")
-@click.option("--days", default=7, show_default=True, help="Days to analyze")
-def explain(service: str, days: int) -> None:
+@click.option("--days", default=30, show_default=True, help="Days to analyze")
+@click.pass_context
+def explain(ctx: click.Context, service: str, days: int) -> None:
     """Get an AI explanation of cost anomalies for a specific service."""
     from finops.collectors.cost_explorer import CostExplorerCollector
-    from finops.analyzers.anomaly import detect_anomalies, CostAnomaly
+    from finops.analyzers.anomaly import detect_anomalies
     from finops.ai.explainer import explain_anomaly
 
-    with console.status(f"Fetching data for {service}..."):
-        collector = CostExplorerCollector()
+    with _err_console.status(f"Fetching data for {service}..."):
+        collector = CostExplorerCollector(_build_session(ctx))
         daily_spend = collector.get_daily_spend(days=days)
 
     service_spend = [d for d in daily_spend if d.service == service]
@@ -107,8 +137,14 @@ def explain(service: str, days: int) -> None:
         return
 
     anomaly = anomalies[0]
-    with console.status("[bold]Calling Claude for AI analysis..."):
-        explanation = explain_anomaly(anomaly)
+    with _err_console.status("[bold]Calling Claude for AI analysis..."):
+        explanation = explain_anomaly(
+            service=anomaly.service,
+            current_spend=anomaly.amount,
+            baseline_spend=anomaly.baseline_median,
+            change_pct=anomaly.change_pct,
+            daily_trend=service_spend,
+        )
 
     console.print(Panel(
         explanation,
@@ -121,14 +157,16 @@ def explain(service: str, days: int) -> None:
 @click.option("--service", help="Filter by AWS service type (ec2, rds, ebs)")
 @click.option("--min-savings", default=50.0, show_default=True, help="Minimum monthly savings to report (USD)")
 @click.option("--terraform", is_flag=True, help="Generate Terraform remediation snippets via AI")
-def waste(service: Optional[str], min_savings: float, terraform: bool) -> None:
+@click.pass_context
+def waste(ctx: click.Context, service: Optional[str], min_savings: float, terraform: bool) -> None:
     """Scan for idle and over-provisioned resources."""
     from finops.analyzers.waste import WasteDetector
     from finops.ai.explainer import generate_remediation_terraform
 
-    detector = WasteDetector()
+    session = _build_session(ctx)
+    detector = WasteDetector(session, region=_region(ctx, session))
 
-    with console.status("Scanning for waste..."):
+    with _err_console.status("Scanning for waste..."):
         items = []
         if not service or service == "ec2":
             items += detector.find_idle_ec2_instances()
@@ -167,7 +205,7 @@ def waste(service: Optional[str], min_savings: float, terraform: bool) -> None:
     if terraform:
         console.print("\n[bold]Generating Terraform remediation...[/bold]")
         for item in items[:3]:  # Limit AI calls
-            with console.status(f"Generating fix for {item.resource_id}..."):
+            with _err_console.status(f"Generating fix for {item.resource_id}..."):
                 tf = generate_remediation_terraform(item)
             console.print(Panel(tf, title=f"Remediation: {item.resource_id}", border_style="blue"))
 
@@ -178,20 +216,21 @@ def waste(service: Optional[str], min_savings: float, terraform: bool) -> None:
 @click.option("--top", default=10, show_default=True, help="Show top N services by projected spend")
 @click.option("--json-output", is_flag=True, help="Output as JSON")
 @click.option("--output", default=None, help="Write Markdown report to this file")
-def forecast(days: int, horizon: int, top: int, json_output: bool, output) -> None:
+@click.pass_context
+def forecast(ctx: click.Context, days: int, horizon: int, top: int, json_output: bool, output) -> None:
     """Project future AWS spend using linear regression on historical data."""
     from finops.collectors.cost_explorer import CostExplorerCollector
     from finops.analyzers.forecast import forecast_costs, format_forecast_report
 
-    with console.status(f"[bold green]Fetching {days} days of spend data..."):
-        collector = CostExplorerCollector()
+    with _err_console.status(f"[bold green]Fetching {days} days of spend data..."):
+        collector = CostExplorerCollector(_build_session(ctx))
         daily_spend = collector.get_daily_spend(days=days)
 
     if not daily_spend:
         console.print("[red]No spend data returned from Cost Explorer.[/red]")
         sys.exit(1)
 
-    with console.status("[bold yellow]Running forecast model..."):
+    with _err_console.status("[bold yellow]Running forecast model..."):
         fc = forecast_costs(daily_spend, forecast_days=max(horizon, 90))
 
     if json_output:
@@ -269,25 +308,27 @@ def forecast(days: int, horizon: int, top: int, json_output: bool, output) -> No
 @cli.command()
 @click.option("--month", default=None, help="Month to report (YYYY-MM, default: current month)")
 @click.option("--output", default="executive-summary.md", show_default=True, help="Output file path")
-def report(month: Optional[str], output: str) -> None:
+@click.pass_context
+def report(ctx: click.Context, month: Optional[str], output: str) -> None:
     """Generate an executive FinOps summary report."""
     from finops.collectors.cost_explorer import CostExplorerCollector
     from finops.analyzers.anomaly import detect_anomalies
     from finops.analyzers.waste import WasteDetector
     from finops.ai.explainer import generate_executive_summary
 
-    with console.status("Gathering data for report..."):
-        collector = CostExplorerCollector()
+    session = _build_session(ctx)
+    with _err_console.status("Gathering data for report..."):
+        collector = CostExplorerCollector(session)
         daily_spend = collector.get_daily_spend(days=30)
         service_spend = collector.get_service_spend_summary()
-        forecast = collector.get_cost_forecast()
+        forecast = collector.get_cost_forecast().get("forecast_amount", 0.0)
         anomalies = detect_anomalies(daily_spend)
-        detector = WasteDetector()
+        detector = WasteDetector(session, region=_region(ctx, session))
         waste_items = detector.find_idle_ec2_instances() + detector.find_unattached_ebs_volumes()
 
     total_mtd = sum(d.amount for d in daily_spend if d.date >= datetime.now().replace(day=1).date().isoformat())
 
-    with console.status("Generating executive summary with Claude..."):
+    with _err_console.status("Generating executive summary with Claude..."):
         summary = generate_executive_summary(
             total_mtd=total_mtd,
             forecast=forecast,
@@ -362,7 +403,7 @@ def budgets_list(json_output: bool, critical_only: bool) -> None:
     """List all AWS budgets with spend status and health indicators."""
     from finops.analyzers.budgets import BudgetManager
 
-    with console.status("[bold green]Fetching AWS Budgets..."):
+    with _err_console.status("[bold green]Fetching AWS Budgets..."):
         mgr = BudgetManager()
         all_budgets = mgr.list_budgets()
 
@@ -440,7 +481,7 @@ def budgets_history(budget_name: str, periods: int) -> None:
     """Show historical spend vs budget for a specific budget."""
     from finops.analyzers.budgets import BudgetManager
 
-    with console.status(f"Fetching history for '{budget_name}'..."):
+    with _err_console.status(f"Fetching history for '{budget_name}'..."):
         mgr = BudgetManager()
         history = mgr.get_budget_history(budget_name, periods=periods)
 
@@ -507,7 +548,7 @@ def budgets_create(
 
     from finops.analyzers.budgets import BudgetManager
 
-    with console.status("Creating budget..."):
+    with _err_console.status("Creating budget..."):
         mgr = BudgetManager()
         try:
             mgr.create_monthly_budget(
@@ -532,7 +573,7 @@ def budgets_check(slack: bool, fail_on_critical: bool) -> None:
     """CI-friendly budget health check. Exits non-zero on CRITICAL if --fail-on-critical."""
     from finops.analyzers.budgets import BudgetManager
 
-    with console.status("Checking budget health..."):
+    with _err_console.status("Checking budget health..."):
         mgr = BudgetManager()
         all_budgets = mgr.list_budgets()
 
@@ -562,7 +603,7 @@ def budgets_check(slack: bool, fail_on_critical: bool) -> None:
             import urllib.request
             payload = json.dumps({
                 "text": (
-                    f":rotating_light: *AWS Budget Alert*\n"
+                    ":rotating_light: *AWS Budget Alert*\n"
                     + "\n".join(
                         f"• *{b.name}*: {b.pct_forecasted:.0f}% of ${b.limit_amount:,.0f} limit forecast"
                         for b in (critical + warning)
@@ -595,7 +636,7 @@ def anomalies_list(days: int, min_impact: float, severity: str | None, json_outp
     """List AWS ML-detected cost anomalies."""
     from finops.analyzers.aws_anomaly_detection import AnomalyDetectionManager
 
-    with console.status("[bold yellow]Fetching AWS anomaly detections..."):
+    with _err_console.status("[bold yellow]Fetching AWS anomaly detections..."):
         mgr = AnomalyDetectionManager()
         all_anomalies = mgr.get_anomalies(days_back=days, min_impact_dollars=min_impact)
 
@@ -675,12 +716,12 @@ def anomalies_setup(email: str | None, sns_arn: str | None, threshold: float, fr
 
     mgr = AnomalyDetectionManager()
 
-    with console.status("[bold yellow]Creating SERVICE anomaly monitor..."):
+    with _err_console.status("[bold yellow]Creating SERVICE anomaly monitor..."):
         monitor_arn = mgr.create_service_monitor("AllServicesMonitor")
     console.print(f"[green]✓ Monitor:[/green] {monitor_arn}")
 
     if email or sns_arn:
-        with console.status("[bold yellow]Creating anomaly subscription..."):
+        with _err_console.status("[bold yellow]Creating anomaly subscription..."):
             sub_arn = mgr.create_subscription(
                 name="FinOps-Anomaly-Alerts",
                 monitor_arns=[monitor_arn],
@@ -731,7 +772,7 @@ def savings_coverage(days: int, target: float, json_output: bool) -> None:
     """Show current Savings Plans coverage and identify uncovered spend."""
     from finops.analyzers.savings_plans import SavingsPlansAnalyzer
 
-    with console.status("[bold green]Analyzing Savings Plans coverage..."):
+    with _err_console.status("[bold green]Analyzing Savings Plans coverage..."):
         analyzer = SavingsPlansAnalyzer(lookback_days=days, coverage_target_pct=target)
         result = analyzer.analyze()
 
@@ -805,7 +846,7 @@ def savings_recommend(days: int, target: float, top: int) -> None:
     """Show purchase recommendations to improve Savings Plans coverage."""
     from finops.analyzers.savings_plans import SavingsPlansAnalyzer
 
-    with console.status("[bold green]Fetching SP purchase recommendations..."):
+    with _err_console.status("[bold green]Fetching SP purchase recommendations..."):
         analyzer = SavingsPlansAnalyzer(lookback_days=days, coverage_target_pct=target)
         result = analyzer.analyze()
 
@@ -842,6 +883,305 @@ def savings_recommend(days: int, target: float, top: int) -> None:
         console.print(
             f"\n[bold green]Best recommendation:[/bold green] {best.summary()}"
         )
+
+
+@anomalies.command("detect")
+@click.option("--days", default=45, show_default=True, help="Days of history to analyze")
+@click.option("--threshold", default=2.5, show_default=True, help="Robust z-score threshold (MAD-based)")
+@click.option("--min-change", default=20.0, show_default=True, help="Minimum %% increase vs baseline to flag")
+@click.option("--min-spend", default=1.0, show_default=True, help="Ignore services below this baseline daily spend (USD)")
+@click.option("--by-account", is_flag=True, help="Group by linked account instead of service")
+@click.option("--root-cause/--no-root-cause", default=True, show_default=True,
+              help="Attribute top anomalies to usage types / regions that moved")
+@click.option("--json-output", is_flag=True, help="Output as JSON")
+@click.pass_context
+def anomalies_detect(
+    ctx: click.Context,
+    days: int,
+    threshold: float,
+    min_change: float,
+    min_spend: float,
+    by_account: bool,
+    root_cause: bool,
+    json_output: bool,
+) -> None:
+    """Statistical anomaly detection: rolling median + MAD z-score with weekly seasonality.
+
+    Unlike 'anomalies list' (AWS's ML detector), this runs locally against the
+    Cost Explorer daily series — tunable thresholds, per-day attribution, and
+    no monitor setup required.
+    """
+    from finops.collectors.cost_explorer import CostExplorerCollector
+    from finops.analyzers.anomaly import detect_anomalies, enrich_with_root_causes
+
+    collector = CostExplorerCollector(_build_session(ctx))
+    group_by = "LINKED_ACCOUNT" if by_account else "SERVICE"
+
+    with _err_console.status(f"[bold green]Fetching {days} days of daily spend..."):
+        daily_spend = collector.get_daily_spend(days=days, group_by=group_by)
+
+    if not daily_spend:
+        console.print("[red]No spend data returned from Cost Explorer.[/red]")
+        sys.exit(1)
+
+    with _err_console.status("[bold yellow]Running MAD z-score detection..."):
+        found = detect_anomalies(
+            daily_spend,
+            z_threshold=threshold,
+            min_change_pct=min_change,
+            min_baseline_spend=min_spend,
+        )
+
+    if root_cause and found and not by_account:
+        with _err_console.status("[bold yellow]Attributing root causes (usage type / region)..."):
+            found = enrich_with_root_causes(found, collector)
+
+    if json_output:
+        click.echo(json.dumps([
+            {
+                "service": a.service,
+                "account_id": a.account_id,
+                "date": a.date,
+                "amount": round(a.amount, 2),
+                "baseline_median": round(a.baseline_median, 2),
+                "robust_z": round(a.z_score, 2),
+                "change_pct": round(a.change_pct, 1),
+                "dollar_impact": round(a.dollar_impact, 2),
+                "severity": a.severity,
+                "severity_score": a.severity_score,
+                "root_causes": [
+                    {
+                        "dimension": h.dimension,
+                        "value": h.value,
+                        "day_spend": round(h.anomaly_day_spend, 2),
+                        "baseline_daily_avg": round(h.baseline_daily_avg, 2),
+                        "delta": round(h.delta, 2),
+                        "contribution_pct": round(h.contribution_pct, 1),
+                    }
+                    for h in a.root_causes
+                ],
+            }
+            for a in found
+        ], indent=2))
+        return
+
+    if not found:
+        console.print(f"[green]No anomalies above z={threshold} in the last {days} days.[/green]")
+        return
+
+    severity_color = {"CRITICAL": "red", "HIGH": "yellow", "MEDIUM": "cyan", "LOW": "white"}
+    table = Table(title=f"Statistical Cost Anomalies (last {days}d, z≥{threshold})", box=box.ROUNDED)
+    table.add_column("Severity", justify="center")
+    table.add_column("Service" + (" / Account" if by_account else ""))
+    table.add_column("Date")
+    table.add_column("Spend", justify="right")
+    table.add_column("Baseline", justify="right")
+    table.add_column("Robust z", justify="right")
+    table.add_column("Change", justify="right")
+    table.add_column("Impact", justify="right")
+
+    for a in found[:20]:
+        color = severity_color.get(a.severity, "white")
+        label = a.service if not a.account_id else f"{a.service} ({a.account_id})"
+        table.add_row(
+            f"[{color}]{a.severity}[/{color}]",
+            label,
+            a.date,
+            f"${a.amount:,.2f}",
+            f"${a.baseline_median:,.2f}",
+            f"{a.z_score:.1f}",
+            f"[{color}]+{a.change_pct:.0f}%[/{color}]",
+            f"+${a.dollar_impact:,.2f}",
+        )
+    console.print(table)
+
+    for a in found[:5]:
+        if a.root_causes:
+            console.print(f"\n[bold]{a.service} on {a.date} — likely drivers:[/bold]")
+            for h in a.root_causes:
+                console.print(f"  • {h.summary()}")
+
+
+@cli.command()
+@click.option("--days", default=14, show_default=True, help="CloudWatch look-back window")
+@click.option("--min-savings", default=10.0, show_default=True, help="Minimum monthly savings to report (USD)")
+@click.option("--json-output", is_flag=True, help="Output as JSON")
+@click.pass_context
+def rightsize(ctx: click.Context, days: int, min_savings: float, json_output: bool) -> None:
+    """Recommend EC2 downsizing based on P90 CPU utilization."""
+    from finops.analyzers.rightsizing import RightsizingAnalyzer
+
+    session = _build_session(ctx)
+    region = _region(ctx, session)
+
+    with _err_console.status(f"[bold green]Analyzing EC2 utilization in {region} ({days}d P90)..."):
+        analyzer = RightsizingAnalyzer(session, region=region, lookback_days=days)
+        recs = [r for r in analyzer.recommend() if r.monthly_savings >= min_savings]
+
+    if json_output:
+        click.echo(json.dumps([
+            {
+                "resource_id": r.resource_id,
+                "name": r.name,
+                "region": r.region,
+                "current_type": r.current_type,
+                "recommended_type": r.recommended_type,
+                "avg_cpu_pct": r.avg_cpu_pct,
+                "p90_cpu_pct": r.p90_cpu_pct,
+                "current_monthly_cost": r.current_monthly_cost,
+                "projected_monthly_cost": r.projected_monthly_cost,
+                "monthly_savings": r.monthly_savings,
+                "confidence": r.confidence,
+                "reason": r.reason,
+            }
+            for r in recs
+        ], indent=2))
+        return
+
+    if not recs:
+        console.print("[green]No rightsizing opportunities found — utilization looks healthy.[/green]")
+        return
+
+    total = sum(r.monthly_savings for r in recs)
+    table = Table(title=f"EC2 Rightsizing — ${total:,.0f}/mo potential savings", box=box.ROUNDED)
+    table.add_column("Instance", style="cyan")
+    table.add_column("Current")
+    table.add_column("Recommended", style="bold green")
+    table.add_column("P90 CPU", justify="right")
+    table.add_column("Avg CPU", justify="right")
+    table.add_column("Savings/mo", justify="right", style="green")
+    table.add_column("Confidence", justify="center")
+
+    for r in recs:
+        table.add_row(
+            r.name,
+            r.current_type,
+            r.recommended_type,
+            f"{r.p90_cpu_pct:.0f}%",
+            f"{r.avg_cpu_pct:.0f}%",
+            f"${r.monthly_savings:,.0f}",
+            r.confidence,
+        )
+    console.print(table)
+    console.print("[dim]Sized on worst daily P90 CPU — busiest day must still fit the smaller type.[/dim]")
+
+
+@cli.command()
+@click.option("--days", default=45, show_default=True, help="Days of cost history to analyze")
+@click.option("--threshold", default=2.5, show_default=True, help="Anomaly robust z-score threshold")
+@click.option("--min-savings", default=10.0, show_default=True, help="Minimum monthly savings for findings (USD)")
+@click.option("--slack", is_flag=True, help="Post the digest to Slack")
+@click.option("--dry-run", is_flag=True, help="With --slack: print the Slack payload instead of sending")
+@click.option("--json-output", is_flag=True, help="Output full results as JSON")
+@click.pass_context
+def scan(
+    ctx: click.Context,
+    days: int,
+    threshold: float,
+    min_savings: float,
+    slack: bool,
+    dry_run: bool,
+    json_output: bool,
+) -> None:
+    """Full FinOps scan: anomalies + waste + rightsizing, optionally posted to Slack."""
+    from finops.collectors.cost_explorer import CostExplorerCollector
+    from finops.analyzers.anomaly import detect_anomalies, enrich_with_root_causes
+    from finops.analyzers.rightsizing import RightsizingAnalyzer
+    from finops.analyzers.waste import WasteDetector
+    from finops.reporters.slack import DigestData, SlackReporter
+
+    session = _build_session(ctx)
+    region = _region(ctx, session)
+
+    with _err_console.status("[bold green]Fetching cost data..."):
+        collector = CostExplorerCollector(session)
+        daily_spend = collector.get_daily_spend(days=days)
+        service_spend = collector.get_service_spend_summary()
+        forecast = collector.get_cost_forecast().get("forecast_amount", 0.0)
+
+    total_mtd = sum(
+        d.amount for d in daily_spend
+        if d.date >= datetime.now().replace(day=1).date().isoformat()
+    )
+
+    with _err_console.status("[bold yellow]Detecting anomalies (median + MAD, weekly seasonality)..."):
+        found_anomalies = detect_anomalies(daily_spend, z_threshold=threshold)
+        found_anomalies = enrich_with_root_causes(found_anomalies, collector)
+
+    with _err_console.status(f"[bold red]Scanning {region} for waste..."):
+        waste_items = [
+            w for w in WasteDetector(session, region=region).detect_all()
+            if w.estimated_monthly_cost >= min_savings
+        ]
+
+    with _err_console.status(f"[bold blue]Computing rightsizing recommendations ({region})..."):
+        recs = [
+            r for r in RightsizingAnalyzer(session, region=region).recommend()
+            if r.monthly_savings >= min_savings
+        ]
+
+    top_services = sorted(service_spend, key=lambda s: s.amount_last_30d, reverse=True)[:5]
+
+    if json_output:
+        click.echo(json.dumps({
+            "total_mtd": round(total_mtd, 2),
+            "forecast": round(forecast, 2),
+            "anomalies": [
+                {
+                    "service": a.service, "date": a.date, "amount": round(a.amount, 2),
+                    "robust_z": round(a.z_score, 2), "change_pct": round(a.change_pct, 1),
+                    "severity": a.severity,
+                    "root_causes": [h.summary() for h in a.root_causes],
+                }
+                for a in found_anomalies
+            ],
+            "waste": [
+                {
+                    "category": w.category, "resource_id": w.resource_id,
+                    "monthly_cost": round(w.estimated_monthly_cost, 2), "reason": w.reason,
+                }
+                for w in waste_items
+            ],
+            "rightsizing": [
+                {
+                    "name": r.name, "current_type": r.current_type,
+                    "recommended_type": r.recommended_type,
+                    "monthly_savings": r.monthly_savings, "p90_cpu_pct": r.p90_cpu_pct,
+                }
+                for r in recs
+            ],
+            "total_monthly_savings": round(
+                sum(w.estimated_monthly_cost for w in waste_items)
+                + sum(r.monthly_savings for r in recs), 2
+            ),
+        }, indent=2))
+    else:
+        _print_summary(total_mtd, forecast, found_anomalies, waste_items, top_services)
+        if recs:
+            console.print("\n[bold]Rightsizing:[/bold]")
+            for r in recs[:5]:
+                console.print(f"  • {r.summary()}")
+
+    if slack or dry_run:
+        data = DigestData(
+            total_mtd=total_mtd,
+            forecast=forecast,
+            anomalies=found_anomalies,
+            waste_items=waste_items,
+            rightsizing=recs,
+            top_services=top_services,
+        )
+        try:
+            reporter = SlackReporter(dry_run=dry_run)
+        except ValueError as e:
+            console.print(f"[yellow]⚠ {e}[/yellow]")
+            sys.exit(2)
+        ok = reporter.send_digest(data)
+        if ok and not dry_run:
+            console.print("[green]✓ Digest posted to Slack[/green]")
+        elif not ok:
+            console.print("[red]✗ Slack delivery failed (see logs)[/red]")
+            sys.exit(1)
 
 
 def main() -> None:

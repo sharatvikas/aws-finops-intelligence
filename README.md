@@ -20,8 +20,10 @@ This tool does what a FinOps analyst would do — but runs nightly and sends you
 ## What It Analyzes
 
 ### Anomaly Detection
-- Compares daily spend against rolling 30-day baseline per service/account
-- Uses statistical thresholding (Z-score + IQR) to flag outliers
+- Rolling **median + MAD robust z-score** per service/account against a trailing baseline — one previous spike can't inflate the baseline and mask the next one
+- **Week-over-week seasonality guard**: spend matching its same-weekday norm (weekend batch jobs, Monday scale-ups) is not flagged
+- **Severity scoring** (0–100) combining statistical surprise, relative change, and absolute dollar impact
+- **Root-cause hints**: re-queries Cost Explorer by `USAGE_TYPE` / `REGION` scoped to the anomalous service and reports which dimension values moved
 - AI explains *why* the anomaly likely occurred (correlates with deployments, auto-scaling events)
 
 ### Waste Identification
@@ -36,9 +38,10 @@ This tool does what a FinOps analyst would do — but runs nightly and sends you
 | Nat Gateway overuse | Compare with Transit Gateway cost |
 
 ### Rightsizing
-- EC2: Recommends instance family/size based on CPU, memory, network P90 metrics
-- RDS: Multi-AZ necessity check, read replica utilization
-- EKS: Node group rightsizing based on pod resource requests vs. node capacity
+- EC2: sizes on the **worst daily P90 CPU** over 14 days — the busiest day must still fit the smaller instance
+- Two sizes down when P90 < 20%, one when P90 < 40%; burstable (t-family) instances never jump more than one size (CPU-credit behaviour changes per size)
+- Dollar impact per recommendation (current vs projected monthly cost) with a confidence grade
+- RDS: oversized-instance detection via CPU utilization (see waste detection)
 
 ### Savings Plan / RI Analysis
 - On-Demand coverage gaps where Savings Plans would save >20%
@@ -109,12 +112,88 @@ TERRAFORM REMEDIATION
 git clone https://github.com/sharatvikas/aws-finops-intelligence.git
 cd aws-finops-intelligence
 pip install -e ".[dev]"
-cp config/config.example.yaml config/config.yaml
 
-# Configure AWS profiles and thresholds in config.yaml
-# Then run:
-finops analyze --account prod --output slack,html
+finops scan            # anomalies + waste + rightsizing in one pass
 ```
+
+## CLI
+
+Global options work on every command: `--profile <aws-profile>`, `--region <region>`, `-v/--verbose`.
+
+```bash
+# Full FinOps scan: anomalies + waste + rightsizing, posted to Slack
+finops --profile prod scan --days 45 --threshold 2.5 --slack
+
+# Preview exactly what would be sent (prints the Block Kit JSON, sends nothing)
+finops scan --slack --dry-run
+
+# Statistical anomaly detection (median + MAD, weekly seasonality, root causes)
+finops anomalies detect --days 45 --threshold 3.0 --json-output
+finops anomalies detect --by-account          # group by linked account
+finops anomalies list                          # AWS's ML detector, by contrast
+
+# EC2 rightsizing from CloudWatch P90 CPU
+finops --region us-west-2 rightsize --days 14 --min-savings 50 --json-output
+
+# Waste scan, spend summary, forecast, budgets, savings plans
+finops waste --min-savings 100
+finops analyze --top 10
+finops forecast --horizon 90
+finops budgets list --critical-only
+finops savings coverage
+```
+
+All `--json-output` modes print clean JSON to stdout (progress spinners go to
+stderr), so `finops scan --json-output | jq .total_monthly_savings` just works.
+
+### Anomaly detection example
+
+```
+$ finops anomalies detect --days 45
+     Statistical Cost Anomalies (last 45d, z≥2.5)
+╭──────────┬────────────┬────────────┬───────────┬──────────┬──────────┬────────┬────────────╮
+│ Severity │ Service    │ Date       │     Spend │ Baseline │ Robust z │ Change │     Impact │
+├──────────┼────────────┼────────────┼───────────┼──────────┼──────────┼────────┼────────────┤
+│ CRITICAL │ Amazon EC2 │ 2026-07-03 │ $8,200.00 │ $5,730.00│      6.7 │   +43% │ +$2,470.00 │
+╰──────────┴────────────┴────────────┴───────────┴──────────┴──────────┴────────┴────────────╯
+
+Amazon EC2 on 2026-07-03 — likely drivers:
+  • USAGE_TYPE=BoxUsage:c5.2xlarge: $2,600.00 vs $310.00/day baseline (+$2,290.00, 93% of the spike)
+  • REGION=us-east-1: $2,650.00 vs $380.00/day baseline (+$2,270.00, 92% of the spike)
+```
+
+## Slack Digest
+
+Two delivery modes — incoming webhook (`SLACK_WEBHOOK_URL`) or bot token
+(`SLACK_BOT_TOKEN` + `SLACK_CHANNEL`). `--dry-run` prints the payload instead
+of sending, e.g.:
+
+```json
+{
+  "text": "AWS FinOps Digest: $47,293 MTD, 1 anomalies, $1,212/mo savings identified",
+  "blocks": [
+    { "type": "header",
+      "text": { "type": "plain_text", "text": "☁️ AWS FinOps Digest — July 05, 2026" } },
+    { "type": "section",
+      "fields": [
+        { "type": "mrkdwn", "text": "*MTD Spend*\n$47,293" },
+        { "type": "mrkdwn", "text": "*Month Forecast*\n$61,800" },
+        { "type": "mrkdwn", "text": "*Savings Identified*\n$1,212/mo" },
+        { "type": "mrkdwn", "text": "*Anomalies*\n1 (1 critical)" } ] },
+    { "type": "divider" },
+    { "type": "section",
+      "text": { "type": "mrkdwn",
+        "text": "*Cost Anomalies*\n🔴 *Amazon EC2*: $8,200 on 2026-07-03 (+43% vs baseline, z=6.7)\n    ↳ _USAGE_TYPE=BoxUsage:c5.2xlarge: $2,600.00 vs $310.00/day baseline (+$2,290.00, 93% of the spike)_" } },
+    { "type": "section",
+      "text": { "type": "mrkdwn",
+        "text": "*Rightsizing* ($372/mo potential)\n• `analytics-worker`: c5.4xlarge → *c5.xlarge* — save $372/mo (P90 CPU 12%, HIGH)" } }
+  ]
+}
+```
+
+The digest renders as: header, MTD/forecast/savings/anomaly summary, top
+anomalies with root-cause hints, waste findings, rightsizing recommendations
+with monthly $ impact, and top services by spend.
 
 ### Scheduled Nightly Run (Lambda)
 
@@ -133,25 +212,24 @@ cdk deploy FinOpsStack \
 aws-finops-intelligence/
 ├── src/
 │   └── finops/
-│       ├── collectors/       # AWS API data collection
-│       │   ├── cost_explorer.py
-│       │   ├── cloudwatch.py
-│       │   └── resource_apis.py
-│       ├── analyzers/        # Detection logic
-│       │   ├── anomaly.py    # Statistical anomaly detection
-│       │   ├── waste.py      # Waste identification rules
-│       │   └── rightsizing.py
-│       ├── ai/               # Claude API integration
-│       │   ├── explainer.py  # Natural language explanations
-│       │   └── remediator.py # Terraform snippet generation
-│       └── reporters/        # Output formatters
-│           ├── slack.py
-│           ├── html.py
+│       ├── cli.py                    # `finops` entrypoint (click)
+│       ├── pricing.py                # static on-demand price table + size ladder
+│       ├── collectors/
+│       │   └── cost_explorer.py      # daily spend, dimension breakdowns, forecast
+│       ├── analyzers/
+│       │   ├── anomaly.py            # median+MAD z-score, seasonality, root causes
+│       │   ├── rightsizing.py        # EC2 P90-CPU downsize recommendations
+│       │   ├── waste.py              # idle EC2, unattached EBS, EIPs, snapshots, RDS
+│       │   ├── forecast.py           # linear-regression spend projection
+│       │   ├── budgets.py            # AWS Budgets management
+│       │   ├── savings_plans.py      # SP coverage + purchase recommendations
+│       │   └── aws_anomaly_detection.py  # AWS Cost Anomaly Detection API
+│       ├── ai/
+│       │   └── explainer.py          # Claude explanations + Terraform remediation
+│       └── reporters/
+│           ├── slack.py              # Block Kit digest (webhook / bot token / dry-run)
 │           └── terraform.py
-├── cdk/                      # Lambda deployment CDK stack
-├── config/
-│   └── config.example.yaml
-└── tests/
+└── tests/                            # pytest: moto + stubbed boto3 clients
 ```
 
 ---
@@ -181,13 +259,14 @@ thresholds:
 
 - [x] EC2 waste detection
 - [x] EBS unattached volume detection
-- [x] Cost anomaly detection
-- [x] Slack daily digest
+- [x] Cost anomaly detection (robust MAD z-score + seasonality + root-cause hints)
+- [x] EC2 rightsizing (P90 CPU based)
+- [x] Slack daily digest (webhook + bot token, dry-run)
+- [x] Savings Plan gap analysis
 - [ ] RDS rightsizing
-- [ ] Savings Plan gap analysis
 - [ ] Terraform remediation auto-PR
 - [ ] Grafana dashboard export
-- [ ] Multi-account Organizations support
+- [ ] Multi-account Organizations support (per-account anomaly grouping done)
 - [ ] Bedrock model option (no external API)
 
 ---

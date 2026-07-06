@@ -9,8 +9,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
-from datetime import date, timedelta
-from typing import Any
+from datetime import date
 
 from finops.collectors.cost_explorer import DailySpend
 

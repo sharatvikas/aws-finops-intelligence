@@ -15,11 +15,9 @@ AWS API calls:
 
 from __future__ import annotations
 
-import json
 import logging
 from dataclasses import dataclass, field
-from datetime import date, datetime, timedelta
-from typing import Any
+from datetime import date, timedelta
 
 import boto3
 from botocore.exceptions import ClientError
@@ -246,7 +244,6 @@ class SavingsPlansAnalyzer:
                         LookbackPeriodInDays="THIRTY_DAYS",
                     )
                     summary = resp.get("SavingsPlansPurchaseRecommendation", {})
-                    rec_details = summary.get("SavingsPlansPurchaseRecommendationDetails", [])
                     rec_sum = summary.get("SavingsPlansPurchaseRecommendationSummary", {})
 
                     if not rec_sum:

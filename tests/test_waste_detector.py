@@ -38,11 +38,7 @@ class TestFindUnattachedEBSVolumes:
 
     def test_attached_volume_not_flagged(self, aws_session):
         ec2 = aws_session.client("ec2", region_name="us-east-1")
-        # Create an instance first
-        ami = ec2.describe_images(
-            Filters=[{"Name": "name", "Values": ["amzn2-ami-*"]}]
-        )
-        # Use a known moto AMI
+        # Create an instance first (using a known moto AMI)
         instance = ec2.run_instances(
             ImageId="ami-12c6146b",
             MinCount=1,
@@ -83,8 +79,8 @@ class TestFindUnattachedEBSVolumes:
 
         assert len(items) >= 1
         item = items[0]
-        assert item.category == "storage"
-        assert item.resource_type == "EBS Volume"
+        assert item.category == "Unattached EBS"
+        assert item.resource_type.startswith("aws_ebs_volume")
         assert item.estimated_monthly_cost > 0
         assert item.remediation != ""
 

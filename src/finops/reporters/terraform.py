@@ -9,7 +9,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from textwrap import dedent
-from typing import Any
 
 from finops.analyzers.waste import WasteItem
 
