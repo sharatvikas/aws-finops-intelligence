@@ -116,6 +116,16 @@ pip install -e ".[dev]"
 finops scan            # anomalies + waste + rightsizing in one pass
 ```
 
+## Try it locally
+
+A fully offline, one-command demo runs the **real** CLI — cost collector, MAD anomaly detector, EC2 rightsizing, and the Slack Block Kit reporter — against a synthetic AWS backend. No AWS credentials, no network, no Slack webhook required (`boto3.Session` is swapped for a fake serving a fabricated dataset):
+
+```bash
+python demo/run_demo.py
+```
+
+It invokes four real CLI commands in sequence (anomaly detection, rightsizing, a full scan with a Slack dry-run payload, and the same scan as JSON), demonstrating the analytics and reporting end-to-end. See [`demo/OUTPUT.md`](demo/OUTPUT.md) for a captured real run and [`demo/README.md`](demo/README.md) for how the synthetic backend works.
+
 ## CLI
 
 Global options work on every command: `--profile <aws-profile>`, `--region <region>`, `-v/--verbose`.
